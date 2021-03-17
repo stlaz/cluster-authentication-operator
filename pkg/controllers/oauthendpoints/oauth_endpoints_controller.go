@@ -10,7 +10,7 @@ import (
 	"k8s.io/klog/v2"
 
 	corev1 "k8s.io/api/core/v1"
-	corev1informers "k8s.io/client-go/informers/core/v1"
+	"k8s.io/client-go/informers"
 	corev1listers "k8s.io/client-go/listers/core/v1"
 
 	routev1 "github.com/openshift/api/route/v1"
@@ -28,14 +28,18 @@ import (
 // NewOAuthRouteCheckController returns a controller that checks the health of authentication route.
 func NewOAuthRouteCheckController(
 	operatorClient v1helpers.OperatorClient,
-	secretInformerForNamespaces corev1informers.SecretInformer,
+	kubeInformersForTargetNS informers.SharedInformerFactory,
+	kubeInformersForConfigManagedNS informers.SharedInformerFactory,
 	routeInformerNamespaces routev1informers.RouteInformer,
 	ingressInformerAllNamespaces configv1informers.IngressInformer,
 	systemCABundle []byte,
 	recorder events.Recorder,
 ) factory.Controller {
-	secretLister := secretInformerForNamespaces.Lister()
-	secretInformer := secretInformerForNamespaces.Informer()
+	cmLister := kubeInformersForConfigManagedNS.Core().V1().ConfigMaps().Lister()
+	cmInformer := kubeInformersForConfigManagedNS.Core().V1().ConfigMaps().Informer()
+
+	secretLister := kubeInformersForTargetNS.Core().V1().Secrets().Lister()
+	secretInformer := kubeInformersForTargetNS.Core().V1().Secrets().Informer()
 	routeLister := routeInformerNamespaces.Lister()
 	routeInformer := routeInformerNamespaces.Informer()
 	ingressLister := ingressInformerAllNamespaces.Lister()
@@ -46,63 +50,71 @@ func NewOAuthRouteCheckController(
 	}
 
 	getTLSConfigFunc := func() (*tls.Config, error) {
-		return getOAuthRouteTLSConfig(secretLister, ingressLister, systemCABundle, recorder)
+		return getOAuthRouteTLSConfig(cmLister, secretLister, ingressLister, systemCABundle, recorder)
 	}
 
 	return endpointaccessible.NewEndpointAccessibleController(
 		"OAuthServerRoute",
-		operatorClient, endpointListFunc, getTLSConfigFunc, []factory.Informer{routeInformer, secretInformer, ingressInformer}, recorder)
+		operatorClient,
+		endpointListFunc, getTLSConfigFunc,
+		[]factory.Informer{
+			cmInformer,
+			secretInformer,
+			routeInformer,
+			ingressInformer,
+		},
+		recorder)
 }
 
 // NewOAuthServiceCheckController returns a controller that checks the health of authentication service.
 func NewOAuthServiceCheckController(
 	operatorClient v1helpers.OperatorClient,
-	secretInformerForNamespaces corev1informers.SecretInformer,
-	corev1Informers corev1informers.Interface,
+	kubeInformersForTargetNS informers.SharedInformerFactory,
 	recorder events.Recorder,
 ) factory.Controller {
-	secretLister := secretInformerForNamespaces.Lister()
-	secretInformer := secretInformerForNamespaces.Informer()
-	serviceLister := corev1Informers.Services().Lister()
-	serviceInformer := corev1Informers.Services().Informer()
-
 	endpointsListFunc := func() ([]string, error) {
-		return listOAuthServices(serviceLister, recorder)
+		return listOAuthServices(kubeInformersForTargetNS.Core().V1().Services().Lister(), recorder)
 	}
 
 	getTLSConfigFunc := func() (*tls.Config, error) {
-		return getOAuthEndpointTLSConfig(secretLister, recorder)
+		return getOAuthEndpointTLSConfig(kubeInformersForTargetNS.Core().V1().ConfigMaps().Lister(), recorder)
 	}
 
 	return endpointaccessible.NewEndpointAccessibleController(
 		"OAuthServerService",
-		operatorClient, endpointsListFunc, getTLSConfigFunc, []factory.Informer{serviceInformer, secretInformer}, recorder)
+		operatorClient,
+		endpointsListFunc, getTLSConfigFunc,
+		[]factory.Informer{
+			kubeInformersForTargetNS.Core().V1().ConfigMaps().Informer(),
+			kubeInformersForTargetNS.Core().V1().Services().Informer(),
+		},
+		recorder)
 }
 
 // NewOAuthServiceEndpointsCheckController returns a controller that checks the health of authentication service
 // endpoints.
 func NewOAuthServiceEndpointsCheckController(
 	operatorClient v1helpers.OperatorClient,
-	secretInformerForNamespaces corev1informers.SecretInformer,
-	corev1Informers corev1informers.Interface,
+	kubeInformersForTargetNS informers.SharedInformerFactory,
 	recorder events.Recorder,
 ) factory.Controller {
-	secretLister := secretInformerForNamespaces.Lister()
-	secretInformer := secretInformerForNamespaces.Informer()
-	endpointsLister := corev1Informers.Endpoints().Lister()
-	endpointsInformer := corev1Informers.Endpoints().Informer()
-
 	endpointsListFn := func() ([]string, error) {
-		return listOAuthServiceEndpoints(endpointsLister, recorder)
+		return listOAuthServiceEndpoints(kubeInformersForTargetNS.Core().V1().Endpoints().Lister(), recorder)
 	}
 
 	getTLSConfigFunc := func() (*tls.Config, error) {
-		return getOAuthEndpointTLSConfig(secretLister, recorder)
+		return getOAuthEndpointTLSConfig(kubeInformersForTargetNS.Core().V1().ConfigMaps().Lister(), recorder)
 	}
 
 	return endpointaccessible.NewEndpointAccessibleController(
 		"OAuthServerServiceEndpoints",
-		operatorClient, endpointsListFn, getTLSConfigFunc, []factory.Informer{endpointsInformer, secretInformer}, recorder)
+		operatorClient,
+		endpointsListFn, getTLSConfigFunc,
+		[]factory.Informer{
+			kubeInformersForTargetNS.Core().V1().Endpoints().Informer(),
+			kubeInformersForTargetNS.Core().V1().ConfigMaps().Informer(),
+		},
+		recorder)
 }
 
 func listOAuthServiceEndpoints(endpointsLister corev1listers.EndpointsLister, recorder events.Recorder) ([]string, error) {
@@ -166,7 +178,20 @@ func listOAuthRoutes(routeLister routev1listers.RouteLister, recorder events.Rec
 	return toHealthzURL(results), nil
 }
 
-func getOAuthRouteTLSConfig(secretLister corev1listers.SecretLister, ingressLister configv1lister.IngressLister, systemCABundle []byte, recorder events.Recorder) (*tls.Config, error) {
+func getOAuthRouteTLSConfig(cmLister corev1listers.ConfigMapLister, secretLister corev1listers.SecretLister, ingressLister configv1lister.IngressLister, systemCABundle []byte, recorder events.Recorder) (*tls.Config, error) {
+	// get default router CA cert cm
+	defaultIngressCertCM, err := cmLister.ConfigMaps("openshift-config-managed").Get("default-ingress-cert")
+	if err != nil {
+		recorder.Warningf("OAuthRouterCACerts", "failed to retrieve the default router CA certs: %v", err)
+		return nil, err
+	}
+
+	defaultRouterCAPEM, ok := defaultIngressCertCM.Data["ca-bundle.crt"]
+	if !ok {
+		klog.Info("the openshift-config-managed/default-ingress-cert CM does not contain the \"ca-bundle.crt\" key")
+		return nil, err
+	}
+
 	ingress, err := ingressLister.Get("cluster")
 	if err != nil {
 		recorder.Warningf("OAuthRouteSecret", "failed to get ingress config: %v", err)
@@ -183,13 +208,19 @@ func getOAuthRouteTLSConfig(secretLister corev1listers.SecretLister, ingressList
 	}
 
 	// find the domain that matches our route
-	if _, ok := routerSecret.Data[ingress.Spec.Domain]; !ok {
+	routerCertKey, ok := routerSecret.Data[ingress.Spec.Domain]
+	if !ok {
 		klog.Infof("unable to find router certs for domain %s", ingress.Spec.Domain)
 		return nil, nil
 	}
 
 	rootCAs := x509.NewCertPool()
-	if ok := rootCAs.AppendCertsFromPEM(routerSecret.Data[ingress.Spec.Domain]); !ok {
+	if ok := rootCAs.AppendCertsFromPEM([]byte(defaultRouterCAPEM)); !ok {
+		klog.Infof("the default ingress CA bundle did not contain any PEM certificates %s", defaultRouterCAPEM)
+		return nil, nil
+	}
+
+	if ok := rootCAs.AppendCertsFromPEM(routerCertKey); !ok {
 		klog.Infof("failed to parse router certs for domain %s", ingress.Spec.Domain)
 		return nil, nil
 	}
@@ -206,21 +237,21 @@ func getOAuthRouteTLSConfig(secretLister corev1listers.SecretLister, ingressList
 	}, nil
 }
 
-func getOAuthEndpointTLSConfig(secretLister corev1listers.SecretLister, recorder events.Recorder) (*tls.Config, error) {
-	serviceSecret, err := secretLister.Secrets("openshift-authentication").Get("v4-0-config-system-serving-cert")
+func getOAuthEndpointTLSConfig(cmLister corev1listers.ConfigMapLister, recorder events.Recorder) (*tls.Config, error) {
+	serviceCACM, err := cmLister.ConfigMaps("openshift-authentication").Get("v4-0-config-system-service-ca")
 	if err != nil {
 		recorder.Warningf("OAuthEndpointSecret", "failed to get oauth endpoint ca cert: %v", err)
 		return nil, err
 	}
 
 	// find the domain that matches our route
-	if _, ok := serviceSecret.Data["tls.crt"]; !ok {
-		return nil, fmt.Errorf("unable to find service ca bundle")
+	if _, ok := serviceCACM.Data["service-ca.crt"]; !ok {
+		return nil, fmt.Errorf("\"service-ca.crt\" key of the \"openshift-authentication/v4-0-config-system-service-ca\" CM is empty")
 	}
 
 	rootCAs := x509.NewCertPool()
-	if ok := rootCAs.AppendCertsFromPEM(serviceSecret.Data["tls.crt"]); !ok {
-		return nil, fmt.Errorf("no certificates could be parsed from the service ca bundle")
+	if ok := rootCAs.AppendCertsFromPEM([]byte(serviceCACM.Data["service-ca.crt"])); !ok {
+		return nil, fmt.Errorf("no certificates could be parsed from the service-ca CA bundle")
 	}
 	return &tls.Config{
 		RootCAs: rootCAs,
