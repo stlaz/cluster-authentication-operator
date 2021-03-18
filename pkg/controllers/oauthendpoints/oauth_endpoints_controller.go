@@ -1,11 +1,15 @@
 package oauthendpoints
 
 import (
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"fmt"
 	"net"
 	"strconv"
+	"sync"
+	"time"
 
 	"k8s.io/klog/v2"
 
@@ -20,6 +24,7 @@ import (
 	routev1listers "github.com/openshift/client-go/route/listers/route/v1"
 	"github.com/openshift/library-go/pkg/controller/factory"
 	"github.com/openshift/library-go/pkg/operator/events"
+	"github.com/openshift/library-go/pkg/operator/resource/resourcehash"
 	"github.com/openshift/library-go/pkg/operator/v1helpers"
 
 	"github.com/openshift/cluster-authentication-operator/pkg/libs/endpointaccessible"
@@ -50,7 +55,7 @@ func NewOAuthRouteCheckController(
 	}
 
 	getTLSConfigFunc := func() (*tls.Config, error) {
-		return getOAuthRouteTLSConfig(cmLister, secretLister, ingressLister, systemCABundle, recorder)
+		return NewCachedOAautTLSConfigs().getOAuthRouteTLSConfig(cmLister, secretLister, ingressLister, systemCABundle, recorder)
 	}
 
 	return endpointaccessible.NewEndpointAccessibleController(
@@ -77,7 +82,7 @@ func NewOAuthServiceCheckController(
 	}
 
 	getTLSConfigFunc := func() (*tls.Config, error) {
-		return getOAuthEndpointTLSConfig(kubeInformersForTargetNS.Core().V1().ConfigMaps().Lister(), recorder)
+		return NewCachedOAautTLSConfigs().getOAuthEndpointTLSConfig(kubeInformersForTargetNS.Core().V1().ConfigMaps().Lister(), recorder)
 	}
 
 	return endpointaccessible.NewEndpointAccessibleController(
@@ -103,7 +108,7 @@ func NewOAuthServiceEndpointsCheckController(
 	}
 
 	getTLSConfigFunc := func() (*tls.Config, error) {
-		return getOAuthEndpointTLSConfig(kubeInformersForTargetNS.Core().V1().ConfigMaps().Lister(), recorder)
+		return NewCachedOAautTLSConfigs().getOAuthEndpointTLSConfig(kubeInformersForTargetNS.Core().V1().ConfigMaps().Lister(), recorder)
 	}
 
 	return endpointaccessible.NewEndpointAccessibleController(
@@ -178,17 +183,61 @@ func listOAuthRoutes(routeLister routev1listers.RouteLister, recorder events.Rec
 	return toHealthzURL(results), nil
 }
 
-func getOAuthRouteTLSConfig(cmLister corev1listers.ConfigMapLister, secretLister corev1listers.SecretLister, ingressLister configv1lister.IngressLister, systemCABundle []byte, recorder events.Recorder) (*tls.Config, error) {
+type cachedOAauthTLSConfigs struct {
+	cache sync.Map
+}
+
+func NewCachedOAautTLSConfigs() *cachedOAauthTLSConfigs {
+	t := &cachedOAauthTLSConfigs{
+		cache: sync.Map{},
+	}
+
+	// clear the cache every 10 minutes
+	go func() {
+		removeCacheKey := func(key, _ interface{}) bool {
+			t.cache.Delete(key)
+			return true
+		}
+		for {
+			time.Sleep(10 * time.Minute)
+			t.cache.Range(removeCacheKey)
+		}
+	}()
+
+	return t
+}
+
+func getOAuthRouteTLSHashingKey(defaultIngressCertCM *corev1.ConfigMap, routerSecret *corev1.Secret, ingressDomain string) (string, error) {
+	cachingHash := sha256.New()
+	ingressCAHash, err := resourcehash.GetConfigMapHash(defaultIngressCertCM)
+	if err != nil {
+		return "", err
+	}
+	_, err = cachingHash.Write([]byte(ingressCAHash))
+	if err != nil {
+		return "", err
+	}
+	routerCertHash, err := resourcehash.GetSecretHash(routerSecret)
+	if err != nil {
+		return "", err
+	}
+	_, err = cachingHash.Write([]byte(routerCertHash))
+	if err != nil {
+		return "", err
+	}
+	_, err = cachingHash.Write([]byte(ingressDomain))
+	if err != nil {
+		return "", err
+	}
+
+	return base64.RawStdEncoding.EncodeToString(cachingHash.Sum(nil)), nil
+}
+
+func (t *cachedOAauthTLSConfigs) getOAuthRouteTLSConfig(cmLister corev1listers.ConfigMapLister, secretLister corev1listers.SecretLister, ingressLister configv1lister.IngressLister, systemCABundle []byte, recorder events.Recorder) (*tls.Config, error) {
 	// get default router CA cert cm
 	defaultIngressCertCM, err := cmLister.ConfigMaps("openshift-config-managed").Get("default-ingress-cert")
 	if err != nil {
 		recorder.Warningf("OAuthRouterCACerts", "failed to retrieve the default router CA certs: %v", err)
-		return nil, err
-	}
-
-	defaultRouterCAPEM, ok := defaultIngressCertCM.Data["ca-bundle.crt"]
-	if !ok {
-		klog.Info("the openshift-config-managed/default-ingress-cert CM does not contain the \"ca-bundle.crt\" key")
 		return nil, err
 	}
 
@@ -204,6 +253,24 @@ func getOAuthRouteTLSConfig(cmLister corev1listers.ConfigMapLister, secretLister
 	routerSecret, err := secretLister.Secrets("openshift-authentication").Get("v4-0-config-system-router-certs")
 	if err != nil {
 		recorder.Warningf("OAuthRouteSecret", "failed to get oauth route ca cert: %v", err)
+		return nil, err
+	}
+
+	// count the hash and attempt to use the hashed config if it's available
+	resourcesHash, err := getOAuthRouteTLSHashingKey(defaultIngressCertCM, routerSecret, ingress.Spec.Domain)
+	if err != nil {
+		return nil, err
+	}
+
+	config, ok := t.cache.Load(resourcesHash)
+	if ok {
+		return config.(*tls.Config), nil
+	}
+
+	// the config hasn't yet been cached, carry on and store it eventually
+	defaultRouterCAPEM, ok := defaultIngressCertCM.Data["ca-bundle.crt"]
+	if !ok {
+		klog.Info("the openshift-config-managed/default-ingress-cert CM does not contain the \"ca-bundle.crt\" key")
 		return nil, err
 	}
 
@@ -232,16 +299,29 @@ func getOAuthRouteTLSConfig(cmLister corev1listers.ConfigMapLister, secretLister
 		}
 	}
 
-	return &tls.Config{
-		RootCAs: rootCAs,
-	}, nil
+	stored, _ := t.cache.LoadOrStore(resourcesHash,
+		&tls.Config{
+			RootCAs: rootCAs,
+		})
+	return stored.(*tls.Config), nil
 }
 
-func getOAuthEndpointTLSConfig(cmLister corev1listers.ConfigMapLister, recorder events.Recorder) (*tls.Config, error) {
+func (t *cachedOAauthTLSConfigs) getOAuthEndpointTLSConfig(cmLister corev1listers.ConfigMapLister, recorder events.Recorder) (*tls.Config, error) {
 	serviceCACM, err := cmLister.ConfigMaps("openshift-authentication").Get("v4-0-config-system-service-ca")
 	if err != nil {
 		recorder.Warningf("OAuthEndpointSecret", "failed to get oauth endpoint ca cert: %v", err)
 		return nil, err
+	}
+
+	serviceCACMHash, err := resourcehash.GetConfigMapHash(serviceCACM)
+	if err != nil {
+		return nil, err
+	}
+	resourcesHash := sha256.Sum256([]byte(serviceCACMHash))
+	resourcesHashString := base64.RawStdEncoding.EncodeToString(resourcesHash[:])
+	config, ok := t.cache.Load(resourcesHashString)
+	if ok {
+		return config.(*tls.Config), nil
 	}
 
 	// find the domain that matches our route
@@ -253,7 +333,7 @@ func getOAuthEndpointTLSConfig(cmLister corev1listers.ConfigMapLister, recorder 
 	if ok := rootCAs.AppendCertsFromPEM([]byte(serviceCACM.Data["service-ca.crt"])); !ok {
 		return nil, fmt.Errorf("no certificates could be parsed from the service-ca CA bundle")
 	}
-	return &tls.Config{
+	stored, _ := t.cache.LoadOrStore(resourcesHashString, &tls.Config{
 		RootCAs: rootCAs,
 		// Specify a host name allowed by the serving cert of the
 		// endpoints to ensure that TLS validates successfully. The
@@ -261,7 +341,8 @@ func getOAuthEndpointTLSConfig(cmLister corev1listers.ConfigMapLister, recorder 
 		// so accessing the endpoint via IP would otherwise result
 		// in validation failure.
 		ServerName: "oauth-openshift.openshift-authentication.svc",
-	}, nil
+	})
+	return stored.(*tls.Config), nil
 }
 
 func toHealthzURL(urls []string) []string {
