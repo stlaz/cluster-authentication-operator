@@ -76,35 +76,32 @@ func NewWebhookAuthenticatorCertRequester(
 
 func (c *webhookAuthenticatorCertRequester) syncWithConditions(ctx context.Context, syncCtx factory.SyncContext) error {
 	progressing, err := c.sync(ctx, syncCtx)
-
-	if progressing != nil {
-		var progressingText string
-		progressingStatus := operatorv1.ConditionFalse
-		progressingReason := "CertificateAvailable"
-		if *progressing {
-			progressingText = "waiting for CSR to be signed"
-			progressingStatus = operatorv1.ConditionTrue
-			progressingReason = "WaitingForCertificate"
-		}
-
-		_, _, statusErr := v1helpers.UpdateStatus(c.operatorClient,
-			v1helpers.UpdateConditionFn(operatorv1.OperatorCondition{
-				Type:    "AuthenticatorCSRProgressing",
-				Status:  progressingStatus,
-				Reason:  progressingReason,
-				Message: progressingText,
-			}))
-
-		if statusErr != nil {
-			if err != nil {
-				klog.Error("failed to update operator status: %v", statusErr)
-				return err
-			}
-			return statusErr
-		}
+	if err != nil {
+		return err
 	}
 
-	return err
+	// nil == keep the current progressing status
+	if progressing == nil {
+		return nil
+	}
+
+	var progressingText string
+	progressingStatus := operatorv1.ConditionFalse
+	progressingReason := "CertificateAvailable"
+	if *progressing {
+		progressingText = "waiting for CSR to be signed"
+		progressingStatus = operatorv1.ConditionTrue
+		progressingReason = "WaitingForCertificate"
+	}
+
+	_, _, statusErr := v1helpers.UpdateStatus(c.operatorClient,
+		v1helpers.UpdateConditionFn(operatorv1.OperatorCondition{
+			Type:    "AuthenticatorCSRProgressing",
+			Status:  progressingStatus,
+			Reason:  progressingReason,
+			Message: progressingText,
+		}))
+	return statusErr
 }
 
 func (c *webhookAuthenticatorCertRequester) sync(ctx context.Context, syncCtx factory.SyncContext) (progressing *bool, err error) {
@@ -169,6 +166,21 @@ func (c *webhookAuthenticatorCertRequester) sync(ctx context.Context, syncCtx fa
 				if len(csrCert) == 0 {
 					return pbool(true), nil
 				}
+
+				certObj, err := pemDecodeCert(csrCert)
+				if err != nil {
+					return nil, fmt.Errorf("failed to parse the certiticate retrieved from CSR: %w", err)
+				}
+
+				if !key.PublicKey.Equal(certObj.PublicKey) {
+					syncCtx.Recorder().Eventf("CSRBadCertKey", "the public key of the CSR certificate did not match the current private key")
+					klog.Warning("the public key of the CSR certificate did not match the current private key")
+					if err := c.resubmitCSR(ctx, key); err != nil {
+						return nil, err
+					}
+					return pbool(true), nil
+				}
+
 				certSecret, err := c.secretLister.Secrets("openshift-oauth-apiserver").Get(certSecretName)
 				if err != nil {
 					return nil, err
