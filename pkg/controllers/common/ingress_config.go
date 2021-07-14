@@ -71,7 +71,12 @@ func GetCustomRouteHostname(ingress *configv1.Ingress, namespace string, name st
 // GetActiveRouterCertKeyBytes returns a byte array containing the server certificates, a byte array containing the private key,
 // a boolean representing if the default openshift-authentication/v4-0-config-system-router-certs secret is being used, and
 // any errors retrieving the active router secret.
-func GetActiveRouterCertKeyBytes(secretLister corev1listers.SecretLister, ingressConfig *configv1.Ingress, namespace string, defaultSecretName string, customSecretName string) ([]byte, []byte, bool, error) {
+func GetActiveRouterCertKeyBytes(
+	secretLister corev1listers.SecretLister,
+	ingressConfig *configv1.Ingress,
+	namespace string,
+	defaultSecretName string, customSecretName string,
+) (cert []byte, key []byte, isDefaultSecret bool, err error) {
 	secret, err := GetActiveRouterSecret(secretLister, namespace, defaultSecretName, customSecretName)
 	if err != nil {
 		return nil, nil, false, err
@@ -79,16 +84,16 @@ func GetActiveRouterCertKeyBytes(secretLister corev1listers.SecretLister, ingres
 
 	tlsCertKey := corev1.TLSCertKey
 	tlsPrivateKeyKey := corev1.TLSPrivateKeyKey
-	isDefault := secret.GetName() == defaultSecretName
-	if isDefault {
+	isDefaultSecret = secret.GetName() == defaultSecretName
+	if isDefaultSecret {
 		tlsCertKey = ingressConfig.Spec.Domain
 		tlsPrivateKeyKey = ingressConfig.Spec.Domain
 	}
 
-	cert := secret.Data[tlsCertKey]
+	cert = secret.Data[tlsCertKey]
 	privateKey := secret.Data[tlsPrivateKeyKey]
 
-	return cert, privateKey, isDefault, nil
+	return cert, privateKey, isDefaultSecret, nil
 }
 
 // GetActiveRouterSecret returns the secret that contains the serving certificates for the openshift-authentication/oauth-openshift
