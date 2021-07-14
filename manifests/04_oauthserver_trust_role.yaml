@@ -1,0 +1,17 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  annotations:
+    rbac.authorization.kubernetes.io/autoupdate: "true"
+  name: system:openshift:oauth-servercert-trust
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  resourcenames:
+  - oauth-serving-cert
+  verbs:
+  - get
+  - list
+  - watch
